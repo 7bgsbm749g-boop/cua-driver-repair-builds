@@ -1,0 +1,74 @@
+name: Cua Linux profile repair
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact repair source commit
+        required: true
+        default: ca0cee53b639f1e82fadc1c2acdd1805df3b2ea7
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CUA_TELEMETRY_ENABLED: 'false'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: 7bgsbm749g-boop/cua
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Verify pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain)"
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5
+      - uses: ./.github/actions/rust-cache
+        with:
+          workspaces: 'libs/cua-driver/rust -> target'
+          key: linux-profile-repair
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      - name: Test the Linux adapter
+        working-directory: libs/cua-driver/rust
+        run: cargo test --locked -p platform-linux --lib
+      - name: Build the maintained driver
+        working-directory: libs/cua-driver/rust
+        run: cargo build --locked -p cua-driver -p cursor-theme-cli --features cua-driver/portal-input
+      - name: Record exact binary provenance
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, tarfile
+          from pathlib import Path
+          sha = subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert sha == os.environ['EXPECTED_SOURCE_SHA']
+          assert not subprocess.check_output(['git','status','--porcelain'],text=True).strip()
+          binaries = [Path('libs/cua-driver/rust/target/debug') / name for name in ['cua-driver','cua-cursor-theme']]
+          metadata = dict(source_sha=sha, workflow_repository=os.environ['GITHUB_REPOSITORY'],
+                          run_id=os.environ['GITHUB_RUN_ID'], profile='dev, debug=0',
+                          files={p.name:hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in binaries})
+          Path('candidate').mkdir()
+          provenance=Path('candidate/provenance.json')
+          provenance.write_text(json.dumps(metadata,indent=2)+'\n')
+          with tarfile.open('candidate/candidate.tar.gz','w:gz') as archive:
+              for path in binaries:
+                  archive.add(path,arcname=path.name)
+              archive.add(provenance,arcname=provenance.name)
+          print(json.dumps(metadata,indent=2))
+          PY
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: driver-mcp-candidate-Linux-${{ inputs.source_sha }}
+          path: candidate/
+          if-no-files-found: error
+          retention-days: 7
